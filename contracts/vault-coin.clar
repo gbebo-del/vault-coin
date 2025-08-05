@@ -184,3 +184,91 @@
       ;; Update vault state
       (if (and (is-eq remaining-debt u0) (is-eq remaining-collateral u0))
         (map-delete user-vaults tx-sender)
+        (map-set user-vaults tx-sender {
+          collateral-amount: remaining-collateral,
+          debt-amount: remaining-debt,
+          last-update: stacks-block-height,
+          stability-fee-accrued: (get stability-fee-accrued user-vault),
+        })
+      )
+
+      ;; Update global collateral
+      (var-set total-collateral-locked
+        (- (var-get total-collateral-locked) withdraw-collateral)
+      )
+
+      (ok {
+        vbtc-burned: burn-amount,
+        collateral-withdrawn: withdraw-collateral,
+        remaining-debt: remaining-debt,
+      })
+    )
+  )
+)
+
+;; LIQUIDATION SYSTEM
+
+(define-public (liquidate-vault
+    (vault-owner principal)
+    (max-debt-to-clear uint)
+  )
+  (let (
+      (current-price (unwrap! (get-btc-price) ERR-PRICE-ORACLE-FAILED))
+      (target-vault (unwrap! (map-get? user-vaults vault-owner) ERR-VAULT-NOT-FOUND))
+      (collateral-value (/ (* (get collateral-amount target-vault) current-price) PRECISION))
+      (debt-value (get debt-amount target-vault))
+      (current-ratio (if (> debt-value u0)
+        (/ (* collateral-value u100) debt-value)
+        u0
+      ))
+      (liquidation-id (+ (var-get liquidation-counter) u1))
+      (debt-to-clear (if (> max-debt-to-clear debt-value)
+        debt-value
+        max-debt-to-clear
+      ))
+      (collateral-to-seize (+ (/ (* debt-to-clear PRECISION) current-price)
+        (/ (* debt-to-clear PRECISION LIQUIDATION-PENALTY) (* current-price u100))
+      ))
+    )
+    (begin
+      ;; Check if liquidation is justified
+      (asserts! (< current-ratio MIN-COLLATERAL-RATIO)
+        ERR-LIQUIDATION-NOT-REQUIRED
+      )
+      (asserts! (>= (ft-get-balance vault-btc tx-sender) debt-to-clear)
+        ERR-INSUFFICIENT-BALANCE
+      )
+
+      ;; Execute liquidation
+      (try! (ft-burn? vault-btc debt-to-clear tx-sender))
+
+      ;; Update vault state
+      (map-set user-vaults vault-owner {
+        collateral-amount: (- (get collateral-amount target-vault) collateral-to-seize),
+        debt-amount: (- debt-value debt-to-clear),
+        last-update: stacks-block-height,
+        stability-fee-accrued: (get stability-fee-accrued target-vault),
+      })
+
+      ;; Record liquidation event
+      (map-set liquidation-events liquidation-id {
+        vault-owner: vault-owner,
+        liquidator: tx-sender,
+        collateral-seized: collateral-to-seize,
+        debt-cleared: debt-to-clear,
+        timestamp: stacks-block-height,
+      })
+
+      (var-set liquidation-counter liquidation-id)
+      (var-set total-collateral-locked
+        (- (var-get total-collateral-locked) collateral-to-seize)
+      )
+
+      (ok {
+        debt-cleared: debt-to-clear,
+        collateral-seized: collateral-to-seize,
+        liquidation-penalty: (/ (* debt-to-clear LIQUIDATION-PENALTY) u100),
+      })
+    )
+  )
+)
