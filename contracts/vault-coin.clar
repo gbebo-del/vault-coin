@@ -89,3 +89,98 @@
     (ok true)
   )
 )
+
+;; CORE VAULT OPERATIONS
+
+;; Create or add to existing vault and mint VBTC
+(define-public (mint-synthetic-btc
+    (collateral-amount uint)
+    (mint-amount uint)
+  )
+  (let (
+      (current-price (unwrap! (get-btc-price) ERR-PRICE-ORACLE-FAILED))
+      (existing-vault (default-to {
+        collateral-amount: u0,
+        debt-amount: u0,
+        last-update: u0,
+        stability-fee-accrued: u0,
+      }
+        (map-get? user-vaults tx-sender)
+      ))
+      (new-collateral (+ (get collateral-amount existing-vault) collateral-amount))
+      (new-debt (+ (get debt-amount existing-vault) mint-amount))
+      (collateral-value (/ (* new-collateral current-price) PRECISION))
+      (required-collateral (/ (* new-debt (var-get global-collateral-ratio)) u100))
+    )
+    (begin
+      ;; Pre-flight checks
+      (asserts! (not (var-get emergency-shutdown)) ERR-EMERGENCY-SHUTDOWN)
+      (asserts! (> collateral-amount u0) ERR-INVALID-AMOUNT)
+      (asserts! (> mint-amount u0) ERR-INVALID-AMOUNT)
+      (asserts! (>= collateral-value required-collateral)
+        ERR-INSUFFICIENT-COLLATERAL
+      )
+
+      ;; Update vault state
+      (map-set user-vaults tx-sender {
+        collateral-amount: new-collateral,
+        debt-amount: new-debt,
+        last-update: stacks-block-height,
+        stability-fee-accrued: (get stability-fee-accrued existing-vault),
+      })
+
+      ;; Update global state
+      (var-set total-collateral-locked
+        (+ (var-get total-collateral-locked) collateral-amount)
+      )
+
+      ;; Mint synthetic BTC tokens
+      (try! (ft-mint? vault-btc mint-amount tx-sender))
+
+      (ok {
+        collateral-deposited: collateral-amount,
+        vbtc-minted: mint-amount,
+        current-ratio: (/ (* collateral-value u100) new-debt),
+      })
+    )
+  )
+)
+
+;; Burn VBTC and withdraw collateral
+(define-public (redeem-synthetic-btc
+    (burn-amount uint)
+    (withdraw-collateral uint)
+  )
+  (let (
+      (current-price (unwrap! (get-btc-price) ERR-PRICE-ORACLE-FAILED))
+      (user-vault (unwrap! (map-get? user-vaults tx-sender) ERR-VAULT-NOT-FOUND))
+      (user-balance (ft-get-balance vault-btc tx-sender))
+      (remaining-debt (- (get debt-amount user-vault) burn-amount))
+      (remaining-collateral (- (get collateral-amount user-vault) withdraw-collateral))
+      (collateral-value (/ (* remaining-collateral current-price) PRECISION))
+      (required-collateral (if (> remaining-debt u0)
+        (/ (* remaining-debt (var-get global-collateral-ratio)) u100)
+        u0
+      ))
+    )
+    (begin
+      ;; Validation checks
+      (asserts! (not (var-get emergency-shutdown)) ERR-EMERGENCY-SHUTDOWN)
+      (asserts! (>= user-balance burn-amount) ERR-INSUFFICIENT-BALANCE)
+      (asserts! (>= (get debt-amount user-vault) burn-amount) ERR-INVALID-AMOUNT)
+      (asserts! (>= (get collateral-amount user-vault) withdraw-collateral)
+        ERR-INVALID-AMOUNT
+      )
+
+      ;; Ensure remaining position is properly collateralized
+      (asserts!
+        (or (is-eq remaining-debt u0) (>= collateral-value required-collateral))
+        ERR-INSUFFICIENT-COLLATERAL
+      )
+
+      ;; Burn tokens
+      (try! (ft-burn? vault-btc burn-amount tx-sender))
+
+      ;; Update vault state
+      (if (and (is-eq remaining-debt u0) (is-eq remaining-collateral u0))
+        (map-delete user-vaults tx-sender)
